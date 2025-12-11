@@ -1,2 +1,2 @@
-# gsoc-2k-prep
+# gsoc-2k26-prep
 My preparation and experiments for OSGeo/QGIS GSoC.
