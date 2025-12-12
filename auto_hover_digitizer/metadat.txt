@@ -1,0 +1,13 @@
+[general]
+name=Auto Hover Digitizer
+description=Prototype plugin that highlights nearest vertices on hover and prepares for advanced digitizing improvements.
+version=0.1.0
+qgisMinimumVersion=3.16
+author=Abhinav Verma
+email=verma.abhinav0010@gmail.com
+about=This plugin demonstrates hover-based vertex detection in QGIS and serves as the foundation for a proposed GSoC project on enhanced digitizing tools.
+category=Digitizing
+experimental=True
+deprecated=False
+
+[help]
