@@ -1,6 +1,6 @@
 # hover_tool.py
 # Main plugin logic for Auto Hover Digitizer
-# Contains: HoverVertexTool (map tool) and HoverVertexPlugin (plugin wrapper)
+# Contains: HoverVertexTool (map tool) and HoverVertexPlugin (plugin wrapper) 
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor, QIcon
