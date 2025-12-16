@@ -1,13 +1,12 @@
+
+
 # hover_tool.py
-# Clean, final implementation for Auto Hover Digitizer plugin
-# - HoverVertexTool: map tool that highlights nearest vertex on hover
-# - HoverVertexPlugin: plugin wrapper creating QAction and toggling the tool
+# Clean implementation of vertex + segment hover detection plugin
 
 import os
 from qgis.PyQt.QtWidgets import QAction
 from qgis.PyQt.QtGui import QIcon, QColor
-from qgis.PyQt.QtCore import Qt
-from qgis.gui import QgsMapTool, QgsVertexMarker
+from qgis.gui import QgsMapTool, QgsVertexMarker, QgsRubberBand
 from qgis.core import (
     QgsSpatialIndex,
     QgsPointXY,
@@ -18,16 +17,11 @@ from qgis.core import (
 )
 
 # ===========================
-#   MAP TOOL (HOVER LOGIC)
+#   MAP TOOL
 # ===========================
 
 class HoverVertexTool(QgsMapTool):
-    """
-    Map tool that highlights the nearest vertex when the cursor hovers close to it.
-    This is a lightweight Python prototype intended for UX demonstration and plugins.
-    """
-
-    TOLERANCE_PX = 8  # pixel tolerance for hover detection (configurable)
+    TOLERANCE_PX = 8  # pixels
 
     def __init__(self, canvas, layer=None):
         super().__init__(canvas)
@@ -35,147 +29,181 @@ class HoverVertexTool(QgsMapTool):
         self.layer = layer
         self.index = None
         self.marker = None
+        self.segment_band = None
         self._prepare_layer_and_index()
 
     def _prepare_layer_and_index(self):
-        """Choose a layer (selected layer preferred) and build a spatial index."""
+        """Selects a vector layer and builds spatial index."""
         if not self.layer:
-            # prefer selected layers (robust across API differences)
             try:
                 selected = QgsProject.instance().layerTreeRoot().selectedLayersRecursive()
-            except Exception:
+            except:
                 selected = []
+
             if selected:
                 self.layer = selected[0]
             else:
-                # fallback: first vector layer in project
                 for lyr in QgsProject.instance().mapLayers().values():
                     if lyr.type() == lyr.VectorLayer:
                         self.layer = lyr
                         break
 
         if not self.layer:
-            print("HoverVertexTool: No vector layer found. Select a vector layer and re-run.")
+            print("No vector layer found.")
             return
 
-        # Build spatial index (feature bounding boxes)
+        # Build spatial index (correct old-QGIS compatible method)
         feats = list(self.layer.getFeatures())
         self.index = QgsSpatialIndex()
+
         for f in feats:
             try:
-                self.index.insertFeature(f)
+                self.index.addFeature(f)
             except Exception:
                 pass
 
-        print(f"HoverVertexTool: Using layer '{self.layer.name()}' with {len(feats)} features.")
+        print(f"Using layer '{self.layer.name()}' with {len(feats)} features.")
 
     def canvasMoveEvent(self, event):
-        """Handle mouse move events on the canvas and show nearest vertex marker if within tolerance."""
+        """Runs on every mouse move — detect vertex + segment."""
         if not self.layer or not self.index:
             return
 
-        # map units per pixel -> convert pixel tolerance to map units
         mupp = self.canvas.mapUnitsPerPixel()
-        tolerance_map = max(self.TOLERANCE_PX * mupp, 0.0)
+        tolerance = self.TOLERANCE_PX * mupp
 
-        # map coordinate of cursor
-        try:
-            p = self.canvas.getCoordinateTransform().toMapCoordinates(event.pos().x(), event.pos().y())
-        except Exception:
-            # fallback for potential API differences
-            p = self.canvas.getCoordinateTransform().toMapCoordinates(event.pos())
+        # cursor point in map coordinates
+        p = self.canvas.getCoordinateTransform().toMapCoordinates(event.pos())
         cursor_pt = QgsPointXY(p.x(), p.y())
 
-        # make small search bbox around cursor and query spatial index
-        try:
-            rect_geom = QgsGeometry.fromPointXY(cursor_pt).buffer(tolerance_map, 1).boundingBox()
-            candidate_ids = self.index.intersects(rect_geom)
-        except Exception:
-            candidate_ids = []
+        # spatial index search
+        rect = QgsGeometry.fromPointXY(cursor_pt).buffer(tolerance, 1).boundingBox()
+        candidate_ids = self.index.intersects(rect)
 
         if not candidate_ids:
             self._clear_marker()
+            self._clear_segment()
             return
 
-        # iterate candidate features and find nearest vertex
+        # --------------------------
+        #  NEAREST VERTEX DETECTION
+        # --------------------------
+
         nearest_vertex = None
         nearest_dist = None
 
         for fid in candidate_ids:
-            try:
-                feat_iter = self.layer.getFeatures(QgsFeatureRequest(fid))
-                feat = next(feat_iter)
-            except Exception:
-                continue
-
+            feat = next(self.layer.getFeatures(QgsFeatureRequest(fid)))
             geom = feat.geometry()
-            if geom is None or geom.isEmpty():
+            if geom.isEmpty():
                 continue
 
             vertices = []
-            gtype = geom.type()
 
-            if gtype == QgsWkbTypes.PointGeometry:
+            try:
+                for poly in geom.asMultiPolygon():
+                    for ring in poly:
+                        for v in ring:
+                            vertices.append(QgsPointXY(v.x(), v.y()))
+            except:
                 try:
-                    vertices.append(QgsPointXY(geom.asPoint()))
-                except Exception:
+                    for seg in geom.asPolyline():
+                        vertices.append(QgsPointXY(seg.x(), seg.y()))
+                except:
                     pass
-            else:
-                # try multi-polygon (rings), multi-polyline, polyline
-                try:
-                    for poly in geom.asMultiPolygon():
-                        for ring in poly:
-                            vertices.extend([QgsPointXY(v.x(), v.y()) for v in ring])
-                except Exception:
-                    try:
-                        for pl in geom.asMultiPolyline():
-                            for seg in pl:
-                                vertices.extend([QgsPointXY(v.x(), v.y()) for v in seg])
-                    except Exception:
-                        try:
-                            for seg in geom.asPolyline():
-                                vertices.extend([QgsPointXY(v.x(), v.y()) for v in seg])
-                        except Exception:
-                            pass
 
-            # compute nearest vertex from this feature
             for v in vertices:
-                try:
-                    d = QgsGeometry.fromPointXY(v).distance(QgsGeometry.fromPointXY(cursor_pt))
-                except Exception:
-                    continue
+                d = QgsGeometry.fromPointXY(v).distance(QgsGeometry.fromPointXY(cursor_pt))
                 if nearest_dist is None or d < nearest_dist:
                     nearest_dist = d
                     nearest_vertex = v
 
-        # if nearest within tolerance_map -> show marker
-        if nearest_vertex is not None and nearest_dist is not None and nearest_dist <= tolerance_map:
+        if nearest_vertex and nearest_dist <= tolerance:
             self._show_marker(nearest_vertex)
         else:
             self._clear_marker()
 
+        # --------------------------
+        #   SEGMENT DETECTION
+        # --------------------------
+
+        nearest_seg = None
+        nearest_seg_dist = None
+
+        for fid in candidate_ids:
+            feat = next(self.layer.getFeatures(QgsFeatureRequest(fid)))
+            geom = feat.geometry()
+            if geom.isEmpty():
+                continue
+
+            segments = []
+
+            # polygon rings
+            try:
+                for poly in geom.asMultiPolygon():
+                    for ring in poly:
+                        for i in range(len(ring) - 1):
+                            p1 = QgsPointXY(ring[i].x(), ring[i].y())
+                            p2 = QgsPointXY(ring[i+1].x(), ring[i+1].y())
+                            segments.append((p1, p2))
+            except:
+                pass
+
+            # polylines
+            try:
+                line = geom.asPolyline()
+                for i in range(len(line) - 1):
+                    p1 = QgsPointXY(line[i].x(), line[i].y())
+                    p2 = QgsPointXY(line[i+1].x(), line[i+1].y())
+                    segments.append((p1, p2))
+            except:
+                pass
+
+            for (p1, p2) in segments:
+                seg_geom = QgsGeometry.fromPolylineXY([p1, p2])
+                d = seg_geom.distance(QgsGeometry.fromPointXY(cursor_pt))
+                if nearest_seg_dist is None or d < nearest_seg_dist:
+                    nearest_seg_dist = d
+                    nearest_seg = (p1, p2)
+
+        if nearest_seg and nearest_seg_dist <= tolerance:
+            self._show_segment(nearest_seg[0], nearest_seg[1])
+        else:
+            self._clear_segment()
+
+    # --------------------------
+    #  MARKER + SEGMENT DRAWING
+    # --------------------------
+
     def _show_marker(self, pt):
-        """Create or move the vertex marker to the given map coordinate."""
         if not self.marker:
             self.marker = QgsVertexMarker(self.canvas)
             self.marker.setColor(QColor(255, 0, 0))
             self.marker.setIconSize(12)
             self.marker.setIconType(QgsVertexMarker.ICON_BOX)
-            self.marker.setPenWidth(2)
-        try:
-            self.marker.setCenter(pt)
-        except Exception:
-            # In rare cases setCenter can fail if pt invalid
-            pass
+
+        self.marker.setCenter(pt)
 
     def _clear_marker(self):
-        """Remove the marker if present."""
         if self.marker:
-            try:
-                self.canvas.scene().removeItem(self.marker)
-            except Exception:
-                pass
+            self.canvas.scene().removeItem(self.marker)
             self.marker = None
+
+    def _show_segment(self, p1, p2):
+        if not self.segment_band:
+            self.segment_band = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+            self.segment_band.setColor(QColor(0, 0, 255))
+            self.segment_band.setWidth(2)
+
+        self.segment_band.reset(QgsWkbTypes.LineGeometry)
+        self.segment_band.addPoint(p1, False)
+        self.segment_band.addPoint(p2, True)
+        self.segment_band.show()
+
+    def _clear_segment(self):
+        if self.segment_band:
+            self.segment_band.reset(QgsWkbTypes.LineGeometry)
+            self.segment_band.hide()
 
 
 # ===========================
@@ -183,10 +211,6 @@ class HoverVertexTool(QgsMapTool):
 # ===========================
 
 class HoverVertexPlugin:
-    """
-    Plugin wrapper used by QGIS. QGIS calls classFactory() from __init__.py which must return an instance of this class.
-    """
-
     def __init__(self, iface):
         self.iface = iface
         self.canvas = iface.mapCanvas()
@@ -194,69 +218,23 @@ class HoverVertexPlugin:
         self.tool = None
 
     def initGui(self):
-        """Called when the plugin is enabled. Create a QAction and add it to the toolbar/menu."""
-        # Try to load local icon.png if present
         icon = QIcon()
-        try:
-            base = os.path.dirname(__file__)
-            icon_path = os.path.join(base, "icon.png")
-            if os.path.exists(icon_path):
-                icon = QIcon(icon_path)
-        except Exception:
-            icon = QIcon()
-
-        # QAction with icon and label
         self.action = QAction(icon, "Hover Digitizer", self.iface.mainWindow())
         self.action.setCheckable(True)
         self.action.triggered.connect(self._toggle_tool)
 
-        # add to toolbar and plugin menu (some API versions may have different method names)
-        try:
-            self.iface.addToolBarIcon(self.action)
-        except Exception:
-            # fallback: some QGIS builds may expose different API - ignore if fails
-            pass
-
-        try:
-            self.iface.addPluginToMenu("&Auto Hover Digitizer", self.action)
-        except Exception:
-            pass
-
-        print("HoverVertexPlugin: GUI initialized.")
+        self.iface.addToolBarIcon(self.action)
+        self.iface.addPluginToMenu("&Auto Hover Digitizer", self.action)
 
     def unload(self):
-        """Remove toolbar icon/menu and unset the tool when plugin is disabled/unloaded."""
-        try:
-            if self.action:
-                # if tool active, unset it
-                if hasattr(self, "tool") and self.canvas.mapTool() == self.tool:
-                    self.canvas.unsetMapTool(self.tool)
-                try:
-                    self.iface.removeToolBarIcon(self.action)
-                except Exception:
-                    pass
-                try:
-                    self.iface.removePluginMenu("&Auto Hover Digitizer", self.action)
-                except Exception:
-                    pass
-                self.action = None
-        except Exception as e:
-            print("HoverVertexPlugin unload error:", e)
-        print("HoverVertexPlugin unloaded.")
+        if self.action:
+            self.iface.removeToolBarIcon(self.action)
+            self.iface.removePluginMenu("&Auto Hover Digitizer", self.action)
 
     def _toggle_tool(self, checked):
-        """Enable or disable the hover map tool based on QAction checked state."""
         if checked:
-            # create tool instance (rebuild index on init) and set it as active map tool
             self.tool = HoverVertexTool(self.canvas)
             self.canvas.setMapTool(self.tool)
-            print("Hover digitizer tool activated.")
         else:
-            # deactivate
-            if hasattr(self, "tool") and self.tool:
-                try:
-                    self.canvas.unsetMapTool(self.tool)
-                except Exception:
-                    pass
-                self.tool = None
-                print("Hover digitizer tool deactivated.")
+            self.canvas.unsetMapTool(self.tool)
+            self.tool = None
